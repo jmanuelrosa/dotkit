@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Copy dotkit's modules into consumer repositories, or report how far each has drifted.
+
+A consumer opts in with a `dotkit.json` at its root naming the package directory the
+modules land in. Vendoring rewrites the modules and records this repository's commit and
+each module's sha256 in that file, which is what the consumer's own offline test checks.
+"""
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from dotkit import ui
+
+SOURCE = ROOT / "dotkit"
+MODULES = ("ui.py", "colors.py")
+LOCK = "dotkit.json"
+
+
+class Refusal(Exception):
+    pass
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def git(*args):
+    result = subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Refusal(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def source_rev():
+    """The commit being vendored, refused when it would not describe the files copied."""
+    if git("status", "--porcelain", "--", *(f"dotkit/{name}" for name in MODULES)):
+        raise Refusal("dotkit has uncommitted changes to the vendored modules; commit them first")
+    return git("rev-parse", "HEAD")
+
+
+def read_lock(consumer):
+    path = consumer / LOCK
+    if not path.is_file():
+        raise Refusal(f"no {LOCK} in {ui.path(consumer)}")
+    lock = json.loads(path.read_text())
+    target = consumer / lock["target"]
+    if not target.is_dir():
+        raise Refusal(f"{ui.path(target)}, named by {LOCK}, is not a directory")
+    return path, lock, target
+
+
+def vendor(consumer, rev):
+    path, lock, target = read_lock(consumer)
+    files = {}
+    for name in MODULES:
+        data = (SOURCE / name).read_bytes()
+        (target / name).write_bytes(data)
+        files[name] = digest(data)
+    lock.update(rev=rev, files=files)
+    path.write_text(json.dumps(lock, indent=2) + "\n")
+    ui.ok(f"Vendored {rev[:12]} into {ui.path(target)}")
+
+
+def check(consumer):
+    """How many modules in the consumer differ from what was vendored or from dotkit now."""
+    _, lock, target = read_lock(consumer)
+    recorded = lock.get("files", {})
+    drifted = 0
+    for name in MODULES:
+        copy = target / name
+        if not copy.is_file():
+            ui.err(f"{ui.path(copy)} is missing")
+        elif digest(copy.read_bytes()) != recorded.get(name):
+            ui.err(f"{ui.path(copy)} was edited after vendoring")
+        elif recorded[name] != digest((SOURCE / name).read_bytes()):
+            ui.warn(f"{ui.path(copy)} is behind dotkit")
+        else:
+            continue
+        drifted += 1
+    if not drifted:
+        ui.ok(f"{ui.path(target)} matches dotkit")
+    return drifted
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="dotkit-vendor", description=__doc__.splitlines()[0])
+    parser.add_argument("--check", action="store_true", help="report drift without writing")
+    parser.add_argument("consumers", nargs="+", type=Path, metavar="CONSUMER")
+    args = parser.parse_args(argv)
+    try:
+        if args.check:
+            drifted = sum(check(consumer.resolve()) for consumer in args.consumers)
+            if drifted:
+                ui.done(f"{drifted} drifted module(s)")
+            return 1 if drifted else 0
+        rev = source_rev()
+        for consumer in args.consumers:
+            vendor(consumer.resolve(), rev)
+    except Refusal as refusal:
+        ui.err(str(refusal))
+        return 1
+    ui.done(f"Vendored into {len(args.consumers)} consumer(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
